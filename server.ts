@@ -33,9 +33,19 @@ interface SearchSession {
   unavailableCount: number;
   statusMessageId?: number;
   lastErrorMsgId?: number;
+  checksSinceRestart: number;
 }
 const sessions = new Map<number, SearchSession>();
 const checkedCache = new Map<string, boolean>();
+
+// Limit cache size to prevent memory leaks
+function addToCache(username: string, isAvailable: boolean) {
+  if (checkedCache.size > 5000) {
+    const firstKey = checkedCache.keys().next().value;
+    if (firstKey) checkedCache.delete(firstKey);
+  }
+  checkedCache.set(username, isAvailable);
+}
 
 async function updateStatusMessage(chatId: number, session: SearchSession, status: string = 'Running 🟢') {
   if (!bot || !session.active) return;
@@ -145,7 +155,7 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
     ]);
 
     const isAvailable = result === 'available';
-    if (result !== 'unknown') checkedCache.set(username, isAvailable);
+    if (result !== 'unknown') addToCache(username, isAvailable);
     return isAvailable;
   } catch (error) {
     console.error(`Error checking ${username}:`, error);
@@ -169,28 +179,42 @@ if (bot) {
       active: true,
       availableCount: 0,
       unavailableCount: 0,
+      checksSinceRestart: 0,
     };
     sessions.set(chatId, session);
     await updateStatusMessage(chatId, session, 'Starting...');
 
     let browser;
-    try {
-      browser = await puppeteer.launch({
+    const launchBrowser = async () => {
+      return await puppeteer.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        args: [
+          '--no-sandbox', 
+          '--disable-setuid-sandbox', 
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--no-zygote',
+          '--single-process',
+          '--disable-extensions'
+        ],
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       });
+    };
+
+    try {
+      browser = await launchBrowser();
 
       while (sessions.get(chatId)?.active) {
         try {
-          if (!browser || !browser.isConnected()) {
-            sendTempLog(chatId, 'Starting/Restarting browser...');
+          const currentSession = sessions.get(chatId);
+          if (!currentSession) break;
+
+          // Restart browser periodically to free memory
+          if (currentSession.checksSinceRestart > 40 || !browser || !browser.isConnected()) {
+            sendTempLog(chatId, 'Restarting browser to free memory...');
             if (browser) await browser.close().catch(() => {});
-            browser = await puppeteer.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-              executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-            });
+            browser = await launchBrowser();
+            currentSession.checksSinceRestart = 0;
           }
 
           sendTempLog(chatId, 'Connecting to OpenRouter API to generate usernames...');
@@ -204,7 +228,7 @@ if (bot) {
           const toCheck = usernames.filter(u => !checkedCache.has(u));
           sendTempLog(chatId, `Generated ${usernames.length} usernames. Checking ${toCheck.length} new ones...`);
           
-          const batchSize = 5; // Reduced to 5 for stability in background
+          const batchSize = 2; // Reduced to 2 to save memory
           for (let i = 0; i < toCheck.length; i += batchSize) {
             if (!sessions.get(chatId)?.active) break;
             
@@ -214,6 +238,8 @@ if (bot) {
                 const available = await checkUsernameAvailability(username, browser);
                 const currentSession = sessions.get(chatId);
                 if (!currentSession || !currentSession.active) return;
+
+                currentSession.checksSinceRestart++;
 
                 if (available) {
                   currentSession.availableCount++;
