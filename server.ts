@@ -4,12 +4,13 @@ import OpenAI from 'openai';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dotenv from 'dotenv';
+import async from 'async';
 
 dotenv.config();
 puppeteer.use(StealthPlugin());
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // Dummy endpoint for Render Web Service health check
 app.get('/', (req, res) => {
@@ -97,7 +98,7 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
     });
 
     const prompt = `
-      Generate exactly 50 unique Gmail username ideas.
+      Generate exactly 100 unique Gmail username ideas.
       The user wants usernames that combine a theme word (Nature, Tech, or Anime/Pokémon) with a programming language extension or tech term.
       
       Examples: earth.js, byte.go, pika.rs, ocean.cpp, naruto.ts
@@ -227,14 +228,6 @@ if (bot) {
           const currentSession = sessions.get(chatId);
           if (!currentSession) break;
 
-          // Restart browser periodically to free memory
-          if (currentSession.checksSinceRestart > 40 || !browser || !browser.isConnected()) {
-            sendTempLog(chatId, 'Restarting browser to free memory...');
-            if (browser) await browser.close().catch(() => {});
-            browser = await launchBrowser();
-            currentSession.checksSinceRestart = 0;
-          }
-
           sendTempLog(chatId, 'Connecting to OpenRouter API to generate usernames...');
           const usernames = await generateUsernames(process.env.OPENROUTER_API_KEY || '');
           if (!usernames.length) {
@@ -255,40 +248,55 @@ if (bot) {
             }).catch(err => console.error('Failed to send generated usernames:', err));
           }
           
-          const batchSize = 2; // Reduced to 2 to save memory
-          for (let i = 0; i < toCheck.length; i += batchSize) {
+          // Process in chunks to safely restart browser between chunks without interrupting active checks
+          const chunkSize = 40;
+          for (let i = 0; i < toCheck.length; i += chunkSize) {
             if (!sessions.get(chatId)?.active) break;
             
-            const batch = toCheck.slice(i, i + batchSize);
-            const promises = batch.map(async (username) => {
+            const currentSession = sessions.get(chatId);
+            if (!currentSession) break;
+
+            // Restart browser periodically to free memory
+            if (currentSession.checksSinceRestart >= 40 || !browser || !browser.isConnected()) {
+              sendTempLog(chatId, 'Restarting browser to free memory...');
+              if (browser) await browser.close().catch(() => {});
+              browser = await launchBrowser();
+              currentSession.checksSinceRestart = 0;
+            }
+
+            const chunk = toCheck.slice(i, i + chunkSize);
+            let checkedInChunk = 0;
+            
+            await async.eachLimit(chunk, 10, async (username) => {
+              if (!sessions.get(chatId)?.active) return;
+              
               try {
                 const available = await checkUsernameAvailability(username, browser);
-                const currentSession = sessions.get(chatId);
-                if (!currentSession || !currentSession.active) return;
+                const session = sessions.get(chatId);
+                if (!session || !session.active) return;
 
-                currentSession.checksSinceRestart++;
+                session.checksSinceRestart++;
+                checkedInChunk++;
 
                 if (available) {
-                  currentSession.availableCount++;
+                  session.availableCount++;
                   bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
                     setTimeout(() => {
                       bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
                     }, 120000); // Delete after 2 minutes (120,000 ms)
                   }).catch(err => console.error('Failed to send available message:', err));
                 } else {
-                  currentSession.unavailableCount++;
+                  session.unavailableCount++;
                 }
               } catch (err) {
                 console.error(`Unexpected error checking ${username}:`, err);
               }
             });
-
-            await Promise.all(promises);
             
-            // Update status message after every batch
-            const currentSession = sessions.get(chatId);
-            if (currentSession && currentSession.active) {
-              await updateStatusMessage(chatId, currentSession);
+            // Update status message after every chunk
+            const sessionAfterChunk = sessions.get(chatId);
+            if (sessionAfterChunk && sessionAfterChunk.active) {
+              await updateStatusMessage(chatId, sessionAfterChunk);
             }
           }
           
