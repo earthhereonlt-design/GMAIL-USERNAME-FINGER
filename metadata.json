@@ -1,0 +1,5 @@
+{
+  "name": "Gmail Username Discoverer",
+  "description": "Automatically discovers available Gmail usernames using Gemini AI and Puppeteer.",
+  "requestFramePermissions": []
+}
