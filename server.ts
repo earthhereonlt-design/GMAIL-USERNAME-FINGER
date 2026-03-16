@@ -26,8 +26,28 @@ if (!token) {
 }
 
 const bot = token ? new TelegramBot(token, { polling: true }) : null;
-const activeSearches = new Set<number>();
+
+interface SearchSession {
+  active: boolean;
+  availableCount: number;
+  unavailableCount: number;
+  statusMessageId?: number;
+  intervalId?: NodeJS.Timeout;
+}
+const sessions = new Map<number, SearchSession>();
 const checkedCache = new Map<string, boolean>();
+
+async function sendTempLog(chatId: number, text: string) {
+  if (!bot) return;
+  try {
+    const msg = await bot.sendMessage(chatId, `📝 Log: ${text}`);
+    setTimeout(() => {
+      bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
+    }, 60000);
+  } catch (err) {
+    console.error('Failed to send temp log:', err);
+  }
+}
 
 async function generateUsernames(apiKey: string): Promise<string[]> {
   try {
@@ -109,15 +129,30 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
 }
 
 if (bot) {
-  bot.onText(/\/ig/, async (msg) => {
+  bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
-    if (activeSearches.has(chatId)) {
+    if (sessions.get(chatId)?.active) {
       bot.sendMessage(chatId, 'Bot is already searching! Use /stop to stop.');
       return;
     }
 
-    activeSearches.add(chatId);
     bot.sendMessage(chatId, '🔍 Starting search for available usernames...\nI will only send you the available ones.\nUse /stop to stop the search.');
+    const statusMsg = await bot.sendMessage(chatId, '📊 Status: Starting...\n✅ Available found: 0\n❌ Unavailable checked: 0');
+
+    const session: SearchSession = {
+      active: true,
+      availableCount: 0,
+      unavailableCount: 0,
+      statusMessageId: statusMsg.message_id,
+    };
+
+    session.intervalId = setInterval(() => {
+      if (!session.active) return;
+      const text = `📊 Status: Running 🟢\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
+      bot.editMessageText(text, { chat_id: chatId, message_id: session.statusMessageId }).catch(() => {});
+    }, 10000);
+
+    sessions.set(chatId, session);
 
     let browser;
     try {
@@ -127,26 +162,35 @@ if (bot) {
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       });
 
-      while (activeSearches.has(chatId)) {
+      while (sessions.get(chatId)?.active) {
         try {
+          sendTempLog(chatId, 'Connecting to OpenRouter API to generate usernames...');
           const usernames = await generateUsernames(process.env.OPENROUTER_API_KEY || '');
           if (!usernames.length) {
+            sendTempLog(chatId, 'No usernames generated, retrying in 5s...');
             await new Promise(r => setTimeout(r, 5000));
             continue;
           }
 
           const toCheck = usernames.filter(u => !checkedCache.has(u));
+          sendTempLog(chatId, `Generated ${usernames.length} usernames. Checking ${toCheck.length} new ones...`);
           
           const batchSize = 5; // Reduced to 5 for stability in background
           for (let i = 0; i < toCheck.length; i += batchSize) {
-            if (!activeSearches.has(chatId)) break;
+            if (!sessions.get(chatId)?.active) break;
             
             const batch = toCheck.slice(i, i + batchSize);
             const promises = batch.map(async (username) => {
               try {
                 const available = await checkUsernameAvailability(username, browser);
-                if (available && activeSearches.has(chatId)) {
+                const currentSession = sessions.get(chatId);
+                if (!currentSession || !currentSession.active) return;
+
+                if (available) {
+                  currentSession.availableCount++;
                   bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`);
+                } else {
+                  currentSession.unavailableCount++;
                 }
               } catch (err) {
                 console.error(`Unexpected error checking ${username}:`, err);
@@ -156,16 +200,17 @@ if (bot) {
             await Promise.all(promises);
           }
           
-          if (activeSearches.has(chatId)) {
+          if (sessions.get(chatId)?.active) {
             await new Promise(r => setTimeout(r, 5000)); // Pause between cycles
           }
         } catch (error: any) {
           console.error('Loop error:', error);
           const errorMessage = error?.message || String(error);
           if (errorMessage.includes('429') || errorMessage.includes('Quota')) {
-            bot.sendMessage(chatId, '⚠️ OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...');
+            sendTempLog(chatId, '⚠️ OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...');
             await new Promise(r => setTimeout(r, 60000));
           } else {
+            sendTempLog(chatId, `⚠️ Error occurred: ${errorMessage.substring(0, 50)}... Retrying in 5s.`);
             await new Promise(r => setTimeout(r, 5000));
           }
         }
@@ -173,7 +218,12 @@ if (bot) {
     } catch (error) {
       console.error('Fatal error:', error);
       bot.sendMessage(chatId, '❌ A fatal error occurred. Search stopped.');
-      activeSearches.delete(chatId);
+      const session = sessions.get(chatId);
+      if (session) {
+        session.active = false;
+        if (session.intervalId) clearInterval(session.intervalId);
+        sessions.delete(chatId);
+      }
     } finally {
       if (browser) await browser.close().catch(() => {});
     }
@@ -181,8 +231,17 @@ if (bot) {
 
   bot.onText(/\/stop/, (msg) => {
     const chatId = msg.chat.id;
-    if (activeSearches.has(chatId)) {
-      activeSearches.delete(chatId);
+    const session = sessions.get(chatId);
+    if (session && session.active) {
+      session.active = false;
+      if (session.intervalId) clearInterval(session.intervalId);
+      
+      if (session.statusMessageId) {
+        const text = `📊 Status: Stopped 🔴\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
+        bot.editMessageText(text, { chat_id: chatId, message_id: session.statusMessageId }).catch(() => {});
+      }
+      
+      sessions.delete(chatId);
       bot.sendMessage(chatId, '🛑 Search stopped.');
     } else {
       bot.sendMessage(chatId, 'No active search to stop.');
