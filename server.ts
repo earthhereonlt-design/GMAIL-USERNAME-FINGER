@@ -97,15 +97,15 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
     });
 
     const prompt = `
-      Generate exactly 50 unique, highly obscure Gmail username ideas.
-      To ensure they are available, combine an obscure adjective, a niche tech/nature/anime term, and a random 2-digit number.
+      Generate exactly 50 unique Gmail username ideas.
+      The user wants usernames that combine a theme word (Nature, Tech, or Anime/Pokémon) with a programming language extension or tech term.
       
-      Examples: quantumfern42, cyberpika88, abyssalnode17, neonbulbasaur99
+      Examples: earth.js, byte.go, pika.rs, ocean.cpp, naruto.ts
       
       Rules:
-      - 8 to 15 characters long.
-      - ONLY lowercase letters and numbers. NO DOTS (Gmail ignores dots anyway).
-      - Make them sound cool but rare.
+      - Generate NEW combinations.
+      - 6 to 15 characters long.
+      - ONLY lowercase letters, numbers, and dots.
       - Return ONLY a JSON array of strings. No markdown formatting, just the raw JSON array like ["name1", "name2"].
     `;
 
@@ -117,19 +117,9 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
     const text = completion.choices[0]?.message?.content;
     if (!text) return [];
     
-    let usernames: string[] = [];
-    try {
-      const cleanedText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-      usernames = JSON.parse(cleanedText);
-    } catch (e) {
-      // Fallback regex if model outputs weird formatting
-      const match = text.match(/\[.*?\]/s);
-      if (match) {
-        usernames = JSON.parse(match[0]);
-      }
-    }
-    
-    return Array.isArray(usernames) ? usernames.map((u: any) => String(u).toLowerCase().replace(/[^a-z0-9]/g, '')) : [];
+    const cleanedText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const usernames = JSON.parse(cleanedText);
+    return Array.isArray(usernames) ? usernames.map((u: any) => String(u).toLowerCase().replace(/[^a-z0-9.]/g, '')) : [];
   } catch (error) {
     console.error('Error generating usernames:', error);
     throw error;
@@ -142,27 +132,42 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
   let page;
   try {
     page = await browser.newPage();
+    
+    // Block unnecessary resources to speed up and prevent timeouts
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    await page.goto('https://accounts.google.com/signin', { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Use domcontentloaded for faster navigation
+    await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded', timeout: 20000 });
     
     const emailSelector = 'input[type="email"], input[name="identifier"], #identifierId';
-    await page.waitForSelector(emailSelector, { timeout: 15000 });
+    await page.waitForSelector(emailSelector, { timeout: 10000 });
     
-    // Type with random delay to seem more human
-    await page.type(emailSelector, username, { delay: Math.floor(Math.random() * 50) + 30 });
-    await page.keyboard.press('Enter');
+    // Small random delay to simulate human typing
+    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+    await page.type(emailSelector, username, { delay: 30 });
+    
+    // Press Enter and try to click Next button
+    await Promise.all([
+      page.keyboard.press('Enter'),
+      page.click('#identifierNext button').catch(() => {})
+    ]);
 
     const result = await Promise.race([
       page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 10000 }).then(() => 'taken'),
       page.waitForFunction(() => {
-        const elements = document.querySelectorAll('*');
-        for (const el of elements) {
-          const text = el.textContent || '';
-          if (text.includes("Couldn't find your Google Account") || text.includes("Enter a valid email or phone number")) {
-            return true;
-          }
-        }
-        return false;
+        const text = document.body.innerText || '';
+        return text.includes("Couldn't find your Google Account") || 
+               text.includes("Enter a valid email or phone number") ||
+               text.includes("find your Google account");
       }, { timeout: 10000 }).then(() => 'available'),
       new Promise(resolve => setTimeout(() => resolve('unknown'), 10500))
     ]);
@@ -241,14 +246,13 @@ if (bot) {
           const toCheck = usernames.filter(u => !checkedCache.has(u));
           sendTempLog(chatId, `Generated ${usernames.length} usernames. Checking ${toCheck.length} new ones...`);
           
-          // Send generated usernames to chat for 2 minutes
-          if (toCheck.length > 0) {
-            const generatedMsgText = `✨ Generated ${toCheck.length} usernames to check:\n\`\`\`\n${toCheck.join(', ')}\n\`\`\``;
-            bot.sendMessage(chatId, generatedMsgText, { parse_mode: 'Markdown' }).then(msg => {
+          // Send generated usernames to user for 2 minutes
+          if (usernames.length > 0) {
+            bot.sendMessage(chatId, `📝 Generated Batch:\n${usernames.join(', ')}`).then(msg => {
               setTimeout(() => {
                 bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
-              }, 120000); // Delete after 2 minutes
-            }).catch(err => console.error('Failed to send generated usernames message:', err));
+              }, 120000); // 120,000 ms = 2 minutes
+            }).catch(err => console.error('Failed to send generated usernames:', err));
           }
           
           const batchSize = 2; // Reduced to 2 to save memory
