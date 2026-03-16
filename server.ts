@@ -32,15 +32,42 @@ interface SearchSession {
   availableCount: number;
   unavailableCount: number;
   statusMessageId?: number;
-  intervalId?: NodeJS.Timeout;
+  lastErrorMsgId?: number;
 }
 const sessions = new Map<number, SearchSession>();
 const checkedCache = new Map<string, boolean>();
 
-async function sendTempLog(chatId: number, text: string) {
+async function updateStatusMessage(chatId: number, session: SearchSession, status: string = 'Running 🟢') {
+  if (!bot || !session.active) return;
+  const totalAttempts = session.availableCount + session.unavailableCount;
+  const text = `📊 Status: ${status}\n🔄 Total Attempts: ${totalAttempts}\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
+  
+  try {
+    // Delete old message and send a new one so it stays at the bottom
+    if (session.statusMessageId) {
+      await bot.deleteMessage(chatId, session.statusMessageId).catch(() => {});
+    }
+    const newMsg = await bot.sendMessage(chatId, text);
+    session.statusMessageId = newMsg.message_id;
+  } catch (err) {
+    console.error('Failed to update status message:', err);
+  }
+}
+
+async function sendTempLog(chatId: number, text: string, isError: boolean = false) {
   if (!bot) return;
   try {
-    const msg = await bot.sendMessage(chatId, `📝 Log: ${text}`);
+    const session = sessions.get(chatId);
+    if (isError && session && session.lastErrorMsgId) {
+      await bot.deleteMessage(chatId, session.lastErrorMsgId).catch(() => {});
+    }
+
+    const msg = await bot.sendMessage(chatId, isError ? `⚠️ Error: ${text}` : `📝 Log: ${text}`);
+    
+    if (isError && session) {
+      session.lastErrorMsgId = msg.message_id;
+    }
+
     setTimeout(() => {
       bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
     }, 60000);
@@ -137,22 +164,14 @@ if (bot) {
     }
 
     bot.sendMessage(chatId, '🔍 Starting search for available usernames...\nI will only send you the available ones.\nUse /stop to stop the search.');
-    const statusMsg = await bot.sendMessage(chatId, '📊 Status: Starting...\n✅ Available found: 0\n❌ Unavailable checked: 0');
 
     const session: SearchSession = {
       active: true,
       availableCount: 0,
       unavailableCount: 0,
-      statusMessageId: statusMsg.message_id,
     };
-
-    session.intervalId = setInterval(() => {
-      if (!session.active) return;
-      const text = `📊 Status: Running 🟢\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
-      bot.editMessageText(text, { chat_id: chatId, message_id: session.statusMessageId }).catch(() => {});
-    }, 10000);
-
     sessions.set(chatId, session);
+    await updateStatusMessage(chatId, session, 'Starting...');
 
     let browser;
     try {
@@ -164,6 +183,16 @@ if (bot) {
 
       while (sessions.get(chatId)?.active) {
         try {
+          if (!browser || !browser.isConnected()) {
+            sendTempLog(chatId, 'Starting/Restarting browser...');
+            if (browser) await browser.close().catch(() => {});
+            browser = await puppeteer.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+              executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            });
+          }
+
           sendTempLog(chatId, 'Connecting to OpenRouter API to generate usernames...');
           const usernames = await generateUsernames(process.env.OPENROUTER_API_KEY || '');
           if (!usernames.length) {
@@ -188,7 +217,11 @@ if (bot) {
 
                 if (available) {
                   currentSession.availableCount++;
-                  bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`);
+                  bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                    setTimeout(() => {
+                      bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
+                    }, 120000); // Delete after 2 minutes (120,000 ms)
+                  }).catch(err => console.error('Failed to send available message:', err));
                 } else {
                   currentSession.unavailableCount++;
                 }
@@ -198,6 +231,12 @@ if (bot) {
             });
 
             await Promise.all(promises);
+            
+            // Update status message after every batch
+            const currentSession = sessions.get(chatId);
+            if (currentSession && currentSession.active) {
+              await updateStatusMessage(chatId, currentSession);
+            }
           }
           
           if (sessions.get(chatId)?.active) {
@@ -207,10 +246,14 @@ if (bot) {
           console.error('Loop error:', error);
           const errorMessage = error?.message || String(error);
           if (errorMessage.includes('429') || errorMessage.includes('Quota')) {
-            sendTempLog(chatId, '⚠️ OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...');
+            sendTempLog(chatId, 'OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...', true);
             await new Promise(r => setTimeout(r, 60000));
           } else {
-            sendTempLog(chatId, `⚠️ Error occurred: ${errorMessage.substring(0, 50)}... Retrying in 5s.`);
+            sendTempLog(chatId, `${errorMessage}\n\nRetrying in 5s...`, true);
+            if (browser) {
+              await browser.close().catch(() => {});
+              browser = null; // Force restart on next loop
+            }
             await new Promise(r => setTimeout(r, 5000));
           }
         }
@@ -221,7 +264,6 @@ if (bot) {
       const session = sessions.get(chatId);
       if (session) {
         session.active = false;
-        if (session.intervalId) clearInterval(session.intervalId);
         sessions.delete(chatId);
       }
     } finally {
@@ -234,15 +276,11 @@ if (bot) {
     const session = sessions.get(chatId);
     if (session && session.active) {
       session.active = false;
-      if (session.intervalId) clearInterval(session.intervalId);
       
-      if (session.statusMessageId) {
-        const text = `📊 Status: Stopped 🔴\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
-        bot.editMessageText(text, { chat_id: chatId, message_id: session.statusMessageId }).catch(() => {});
-      }
-      
-      sessions.delete(chatId);
-      bot.sendMessage(chatId, '🛑 Search stopped.');
+      updateStatusMessage(chatId, session, 'Stopped 🔴').then(() => {
+        sessions.delete(chatId);
+        bot.sendMessage(chatId, '🛑 Search stopped.');
+      });
     } else {
       bot.sendMessage(chatId, 'No active search to stop.');
     }
