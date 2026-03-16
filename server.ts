@@ -1,6 +1,6 @@
 import express from 'express';
 import TelegramBot from 'node-telegram-bot-api';
-import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dotenv from 'dotenv';
@@ -31,10 +31,14 @@ const checkedCache = new Map<string, boolean>();
 
 async function generateUsernames(apiKey: string): Promise<string[]> {
   try {
-    const keyToUse = apiKey || process.env.GEMINI_API_KEY;
-    if (!keyToUse) throw new Error("API key is missing.");
+    const keyToUse = apiKey || process.env.OPENROUTER_API_KEY;
+    if (!keyToUse) throw new Error("OpenRouter API key is missing.");
     
-    const ai = new GoogleGenAI({ apiKey: keyToUse });
+    const openai = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey: keyToUse,
+    });
+
     const prompt = `
       Generate exactly 50 unique Gmail username ideas.
       The user wants usernames that combine a theme word (Nature, Tech, or Anime/Pokémon) with a programming language extension or tech term.
@@ -45,19 +49,20 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
       - Generate NEW combinations.
       - 6 to 15 characters long.
       - ONLY lowercase letters, numbers, and dots.
-      - Return ONLY a JSON array of strings. No markdown.
+      - Return ONLY a JSON array of strings. No markdown formatting, just the raw JSON array like ["name1", "name2"].
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: { responseMimeType: 'application/json' },
+    const completion = await openai.chat.completions.create({
+      model: "stepfun/step-3.5-flash:free",
+      messages: [{ role: "user", content: prompt }],
     });
 
-    const text = response.text;
+    const text = completion.choices[0]?.message?.content;
     if (!text) return [];
-    const usernames = JSON.parse(text);
-    return Array.isArray(usernames) ? usernames.map(u => u.toLowerCase().replace(/[^a-z0-9.]/g, '')) : [];
+    
+    const cleanedText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const usernames = JSON.parse(cleanedText);
+    return Array.isArray(usernames) ? usernames.map((u: any) => String(u).toLowerCase().replace(/[^a-z0-9.]/g, '')) : [];
   } catch (error) {
     console.error('Error generating usernames:', error);
     throw error;
@@ -124,7 +129,7 @@ if (bot) {
 
       while (activeSearches.has(chatId)) {
         try {
-          const usernames = await generateUsernames(process.env.GEMINI_API_KEY || '');
+          const usernames = await generateUsernames(process.env.OPENROUTER_API_KEY || '');
           if (!usernames.length) {
             await new Promise(r => setTimeout(r, 5000));
             continue;
@@ -158,7 +163,7 @@ if (bot) {
           console.error('Loop error:', error);
           const errorMessage = error?.message || String(error);
           if (errorMessage.includes('429') || errorMessage.includes('Quota')) {
-            bot.sendMessage(chatId, '⚠️ Gemini API rate limit exceeded. Waiting 60 seconds before retrying...');
+            bot.sendMessage(chatId, '⚠️ OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...');
             await new Promise(r => setTimeout(r, 60000));
           } else {
             await new Promise(r => setTimeout(r, 5000));
