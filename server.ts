@@ -247,6 +247,12 @@ if (bot) {
               }, 120000); // 120,000 ms = 2 minutes
             }).catch(err => console.error('Failed to send generated usernames:', err));
           }
+
+          if (toCheck.length === 0) {
+            sendTempLog(chatId, 'All generated usernames were already checked. Generating a new batch...');
+            await new Promise(r => setTimeout(r, 2000));
+            continue;
+          }
           
           // Process in chunks to safely restart browser between chunks without interrupting active checks
           const chunkSize = 40;
@@ -270,26 +276,42 @@ if (bot) {
             await async.eachLimit(chunk, 10, async (username) => {
               if (!sessions.get(chatId)?.active) return;
               
-              try {
-                const available = await checkUsernameAvailability(username, browser);
-                const session = sessions.get(chatId);
-                if (!session || !session.active) return;
-
-                session.checksSinceRestart++;
-                checkedInChunk++;
-
-                if (available) {
-                  session.availableCount++;
-                  bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
-                    setTimeout(() => {
-                      bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
-                    }, 120000); // Delete after 2 minutes (120,000 ms)
-                  }).catch(err => console.error('Failed to send available message:', err));
-                } else {
-                  session.unavailableCount++;
+              let available = false;
+              let checkSuccess = false;
+              
+              for (let attempt = 1; attempt <= 3; attempt++) {
+                if (!sessions.get(chatId)?.active) return;
+                try {
+                  // Wrap in a timeout to prevent deadlocks if Puppeteer hangs
+                  available = await Promise.race([
+                    checkUsernameAvailability(username, browser),
+                    new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 30000))
+                  ]);
+                  checkSuccess = true;
+                  break; // Success, exit retry loop
+                } catch (err) {
+                  console.error(`Attempt ${attempt} failed for ${username}:`, err);
+                  if (attempt < 3) {
+                    await new Promise(r => setTimeout(r, 2000)); // wait 2s before retry
+                  }
                 }
-              } catch (err) {
-                console.error(`Unexpected error checking ${username}:`, err);
+              }
+              
+              const session = sessions.get(chatId);
+              if (!session || !session.active) return;
+
+              session.checksSinceRestart++;
+              checkedInChunk++;
+
+              if (checkSuccess && available) {
+                session.availableCount++;
+                bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                  setTimeout(() => {
+                    bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
+                  }, 120000); // Delete after 2 minutes (120,000 ms)
+                }).catch(err => console.error('Failed to send available message:', err));
+              } else {
+                session.unavailableCount++;
               }
             });
             
