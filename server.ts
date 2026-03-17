@@ -1,7 +1,7 @@
 import http from 'http';
 import path from 'path';
 import TelegramBot from 'node-telegram-bot-api';
-import { chromium } from 'playwright-extra';
+import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dotenv from 'dotenv';
 import fs from 'fs';
@@ -9,8 +9,9 @@ import os from 'os';
 import { logger } from './src/utils/logger.js';
 
 dotenv.config();
+
 // @ts-ignore
-chromium.use(StealthPlugin());
+puppeteer.use(StealthPlugin());
 
 process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection at:', { promise, reason });
@@ -49,7 +50,11 @@ server.listen(PORT, '0.0.0.0', () => {
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
-  logger.error('TELEGRAM_BOT_TOKEN is missing. Please set it in your environment variables.');
+  logger.error('❌ TELEGRAM_BOT_TOKEN is missing!');
+  logger.info('💡 To fix this:');
+  logger.info('1. Open the "Secrets" panel in the AI Studio UI.');
+  logger.info('2. Add a new secret named "TELEGRAM_BOT_TOKEN" with your bot token from @BotFather.');
+  logger.info('3. The bot will automatically restart once you save the secret.');
 }
 
 const bot = token ? new TelegramBot(token, { polling: true }) : null;
@@ -282,44 +287,41 @@ async function pMapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<
 async function checkUsernameAvailability(username: string, browser: any): Promise<boolean> {
   if (checkedCache.has(username)) return checkedCache.get(username)!;
 
-  let context = null;
   let page = null;
   try {
     logger.debug(`Starting check for: ${username}`);
     
-    // Create an isolated incognito context for every check
-    context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      viewport: { width: 800, height: 600 }
-    });
+    page = await browser.newPage();
     
-    page = await context.newPage();
-    
-    // Block unnecessary resources to speed up and save memory
-    await page.route('**/*', (route: any) => {
-      const type = route.request().resourceType();
+    // Set viewport and user agent
+    await page.setViewport({ width: 800, height: 600 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+
+    // Block unnecessary resources
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+      const type = req.resourceType();
       if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
-        route.abort();
+        req.abort();
       } else {
-        route.continue();
+        req.continue();
       }
     });
 
     logger.debug(`Navigating to Google sign-in for: ${username}`);
     await page.goto('https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin', { 
-      waitUntil: 'commit', 
+      waitUntil: 'networkidle2', 
       timeout: 60000 
     });
     
     const emailSelector = 'input[type="email"]';
     await page.waitForSelector(emailSelector, { timeout: 20000 });
     
-    await page.fill(emailSelector, username);
+    await page.type(emailSelector, username, { delay: 50 });
     await page.keyboard.press('Enter');
 
     logger.debug(`Waiting for result for: ${username}`);
     
-    // Playwright's race is more efficient
     const result = await Promise.any([
       page.waitForSelector('input[type="password"]', { timeout: 15000 }).then(() => 'taken'),
       page.waitForFunction(() => {
@@ -345,7 +347,6 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
     return false;
   } finally {
     if (page) await page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
   }
 }
 
@@ -435,16 +436,17 @@ async function startSearchLoop(chatId: number) {
   let browser: any = null;
 
   const launchBrowser = async () => {
-    // @ts-ignore
-    return await chromium.launch({
+    return await puppeteer.launch({
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox', 
         '--disable-setuid-sandbox', 
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process'
+        '--single-process',
+        '--js-flags="--max-old-space-size=96"'
       ]
     });
   };
