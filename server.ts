@@ -32,6 +32,7 @@ interface SearchSession {
   active: boolean;
   availableCount: number;
   unavailableCount: number;
+  unknownCount: number;
   statusMessageId?: number;
   lastErrorMsgId?: number;
   checksSinceRestart: number;
@@ -51,7 +52,7 @@ function addToCache(username: string, isAvailable: boolean) {
 
 async function updateStatusMessage(chatId: number, session: SearchSession, status: string = 'Running 🟢') {
   if (!bot || !session.active) return;
-  const totalAttempts = session.availableCount + session.unavailableCount;
+  const totalAttempts = session.availableCount + session.unavailableCount + session.unknownCount;
   const checkingText = session.currentChecking.length > 0 
     ? `\n🔍 *Currently checking:* \`${session.currentChecking.join(', ')}\``
     : '';
@@ -63,6 +64,7 @@ async function updateStatusMessage(chatId: number, session: SearchSession, statu
 🔄 *Total Attempts:* \`${totalAttempts}\`
 ✅ *Available:* \`${session.availableCount}\`
 ❌ *Unavailable:* \`${session.unavailableCount}\`
+⚠️ *Unknown/Blocked:* \`${session.unknownCount}\`
 ${checkingText}
 ━━━━━━━━━━━━━━━━━━━━
 _Searching for your next username..._`;
@@ -198,11 +200,15 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
     logger.debug(`Navigating to Google sign-in for: ${username}`);
-    await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // Use a more direct service URL which is often lighter
+    await page.goto('https://accounts.google.com/AccountChooser?service=mail&continue=https://mail.google.com/mail/', { 
+      waitUntil: 'networkidle2', 
+      timeout: 40000 
+    });
     
     const emailSelector = 'input[type="email"], input[name="identifier"], #identifierId';
     logger.debug(`Waiting for email selector for: ${username}`);
-    await page.waitForSelector(emailSelector, { timeout: 15000 });
+    await page.waitForSelector(emailSelector, { timeout: 20000 });
     
     await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
     logger.debug(`Typing username: ${username}`);
@@ -216,26 +222,31 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
 
     logger.debug(`Waiting for result for: ${username}`);
     const result = await Promise.race([
-      page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 15000 }).then(() => 'taken'),
+      page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 20000 }).then(() => 'taken'),
       page.waitForFunction(() => {
         const text = document.body.innerText || '';
         return text.includes("Couldn't find your Google Account") || 
                text.includes("Enter a valid email or phone number") ||
                text.includes("find your Google account");
-      }, { timeout: 15000 }).then(() => 'available'),
-      new Promise(resolve => setTimeout(() => resolve('unknown'), 16000))
+      }, { timeout: 20000 }).then(() => 'available'),
+      page.waitForSelector('#captcha, img[src*="captcha"], iframe[src*="recaptcha"]', { timeout: 20000 }).then(() => 'blocked'),
+      page.waitForFunction(() => {
+        const text = document.body.innerText || '';
+        return text.includes("Verify it's you") || text.includes("unusual activity");
+      }, { timeout: 20000 }).then(() => 'blocked'),
+      new Promise(resolve => setTimeout(() => resolve('unknown'), 22000))
     ]);
 
     logger.info(`Check result for ${username}: ${result}`);
     
-    if (result === 'unknown') {
-      // If unknown, it might be a CAPTCHA or a block. Log the page text for debugging.
+    if (result === 'unknown' || result === 'blocked') {
       const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500));
-      logger.warn(`Unknown result for ${username}. Page snippet: ${bodyText.replace(/\n/g, ' ')}`);
+      logger.warn(`${result === 'blocked' ? 'Blocked by Google' : 'Unknown result'} for ${username}. Page snippet: ${bodyText.replace(/\n/g, ' ')}`);
     }
 
     const isAvailable = result === 'available';
-    if (result !== 'unknown') addToCache(username, isAvailable);
+    // Only cache clear results
+    if (result === 'available' || result === 'taken') addToCache(username, isAvailable);
     return isAvailable;
   } catch (error: any) {
     logger.error(`Error checking ${username}`, { error: error.message });
@@ -259,6 +270,7 @@ if (bot) {
       active: true,
       availableCount: 0,
       unavailableCount: 0,
+      unknownCount: 0,
       checksSinceRestart: 0,
       currentChecking: [],
     };
@@ -330,17 +342,26 @@ if (bot) {
             if (!currentSession) break;
 
             // Restart browser periodically to free memory
-            if (currentSession.checksSinceRestart >= 20 || !browser || !browser.isConnected()) {
+            if (currentSession.checksSinceRestart >= 10 || !browser || !browser.isConnected()) {
               logger.info('Restarting browser to free memory...', { chatId });
               if (browser) await browser.close().catch(() => {});
               browser = await launchBrowser();
               currentSession.checksSinceRestart = 0;
+              
+              // Clear log file if it gets too large (> 5MB)
+              try {
+                const stats = fs.statSync('app.log');
+                if (stats.size > 5 * 1024 * 1024) {
+                  fs.writeFileSync('app.log', '');
+                  logger.info('Log file cleared due to size');
+                }
+              } catch (e) {}
             }
 
             const chunk = toCheck.slice(i, i + chunkSize);
             let checkedInChunk = 0;
             
-            await pMapLimit(chunk, 2, async (username) => {
+            await pMapLimit(chunk, 1, async (username) => {
               const session = sessions.get(chatId);
               if (!session || !session.active) return;
               
@@ -403,16 +424,20 @@ if (bot) {
               sessionFinal.checksSinceRestart++;
               checkedInChunk++;
 
-              if (checkSuccess && available) {
-                sessionFinal.availableCount++;
-                bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
-                  logger.info(`Found available username: ${username}`, { chatId });
-                  setTimeout(() => {
-                    bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
-                  }, 120000); // Delete after 2 minutes (120,000 ms)
-                }).catch(err => logger.error('Failed to send available message', { error: err, username }));
+              if (checkSuccess) {
+                if (available) {
+                  sessionFinal.availableCount++;
+                  bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                    logger.info(`Found available username: ${username}`, { chatId });
+                    setTimeout(() => {
+                      bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
+                    }, 120000); // Delete after 2 minutes (120,000 ms)
+                  }).catch(err => logger.error('Failed to send available message', { error: err, username }));
+                } else {
+                  sessionFinal.unavailableCount++;
+                }
               } else {
-                sessionFinal.unavailableCount++;
+                sessionFinal.unknownCount++;
               }
             });
             
