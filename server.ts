@@ -264,7 +264,13 @@ if (bot) {
           '--disable-dev-shm-usage',
           '--disable-gpu',
           '--no-zygote',
-          '--disable-extensions'
+          '--disable-extensions',
+          '--single-process',
+          '--disable-canvas-aa',
+          '--disable-2d-canvas-clip-aa',
+          '--disable-gl-drawing-for-tests',
+          '--no-first-run',
+          '--js-flags="--max-old-space-size=256"'
         ],
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       });
@@ -313,8 +319,8 @@ if (bot) {
             if (!currentSession) break;
 
             // Restart browser periodically to free memory
-            if (currentSession.checksSinceRestart >= 40 || !browser || !browser.isConnected()) {
-              sendTempLog(chatId, 'Restarting browser to free memory...');
+            if (currentSession.checksSinceRestart >= 20 || !browser || !browser.isConnected()) {
+              logger.info('Restarting browser to free memory...', { chatId });
               if (browser) await browser.close().catch(() => {});
               browser = await launchBrowser();
               currentSession.checksSinceRestart = 0;
@@ -323,7 +329,7 @@ if (bot) {
             const chunk = toCheck.slice(i, i + chunkSize);
             let checkedInChunk = 0;
             
-            await pMapLimit(chunk, 3, async (username) => {
+            await pMapLimit(chunk, 2, async (username) => {
               const session = sessions.get(chatId);
               if (!session || !session.active) return;
               
