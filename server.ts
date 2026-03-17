@@ -38,6 +38,16 @@ if (!token) {
 const bot = token ? new TelegramBot(token, { polling: true }) : null;
 
 if (bot) {
+  // Clear any existing webhooks and verify connection
+  bot.getMe().then((me) => {
+    logger.info(`Bot identified as @${me.username} (${me.id})`);
+    return bot.deleteWebhook();
+  }).then(() => {
+    logger.info('Webhook cleared, polling started.');
+  }).catch((err) => {
+    logger.error('Failed to initialize bot connection:', { error: err.message });
+  });
+
   bot.on('polling_error', (error: any) => {
     if (error.message.includes('ETELEGRAM: 409 Conflict')) {
       // This is common during restarts/deploys as the old instance shuts down
@@ -330,8 +340,20 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
 }
 
 if (bot) {
+  bot.onText(/\/ping/, (msg) => {
+    bot.sendMessage(msg.chat.id, '🏓 Pong! Bot is active and responding.');
+  });
+
+  // Debug: Log all incoming messages
+  bot.on('message', (msg) => {
+    if (msg.text && !msg.text.startsWith('/')) {
+      logger.info(`Message from ${msg.chat.id}: ${msg.text}`);
+    }
+  });
+
   bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
+    logger.info(`Received /start from ${chatId}`);
     if (sessions.get(chatId)?.active) {
       bot.sendMessage(chatId, 'Bot is already searching! Use /stop to stop.');
       return;
