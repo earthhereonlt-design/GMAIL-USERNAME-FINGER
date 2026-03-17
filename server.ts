@@ -1,4 +1,5 @@
 import http from 'http';
+import path from 'path';
 import TelegramBot from 'node-telegram-bot-api';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
@@ -9,7 +10,15 @@ import { logger } from './src/utils/logger.js';
 dotenv.config();
 puppeteer.use(StealthPlugin());
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', { promise, reason });
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', { error: error.message, stack: error.stack });
+});
+
+const PORT = 3000;
 
 // Lightweight health check server using native http
 const server = http.createServer((req, res) => {
@@ -37,9 +46,35 @@ interface SearchSession {
   lastErrorMsgId?: number;
   checksSinceRestart: number;
   currentChecking: string[];
+  apiKey?: string;
 }
 const sessions = new Map<number, SearchSession>();
 const checkedCache = new Map<string, boolean>();
+const SESSIONS_FILE = path.join(process.cwd(), 'sessions.json');
+
+// Persistence: Save/Load sessions
+function saveSessions() {
+  try {
+    const data = Array.from(sessions.entries()).map(([id, s]) => [id, { ...s, currentChecking: [] }]);
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data));
+  } catch (e) {
+    logger.error('Failed to save sessions', { error: e });
+  }
+}
+
+function loadSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+      data.forEach(([id, s]: [number, any]) => {
+        sessions.set(id, s);
+      });
+      logger.info(`Loaded ${sessions.size} sessions from storage`);
+    }
+  } catch (e) {
+    logger.error('Failed to load sessions', { error: e });
+  }
+}
 
 // Limit cache size to prevent memory leaks
 function addToCache(username: string, isAvailable: boolean) {
@@ -249,8 +284,8 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
     if (result === 'available' || result === 'taken') addToCache(username, isAvailable);
     return isAvailable;
   } catch (error: any) {
-    logger.error(`Error checking ${username}`, { error: error.message });
-    return false;
+    // Re-throw the error so the retry loop can handle it (e.g. browser crash)
+    throw error;
   } finally {
     if (page) await page.close().catch(() => {});
   }
@@ -273,211 +308,12 @@ if (bot) {
       unknownCount: 0,
       checksSinceRestart: 0,
       currentChecking: [],
+      apiKey: process.env.OPENROUTER_API_KEY || '',
     };
     sessions.set(chatId, session);
+    saveSessions();
     await updateStatusMessage(chatId, session, 'Starting...');
-
-    let browser;
-    const launchBrowser = async () => {
-      return await puppeteer.launch({
-        headless: true,
-        args: [
-          '--no-sandbox', 
-          '--disable-setuid-sandbox', 
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--no-zygote',
-          '--disable-extensions',
-          '--single-process',
-          '--disable-canvas-aa',
-          '--disable-2d-canvas-clip-aa',
-          '--disable-gl-drawing-for-tests',
-          '--no-first-run',
-          '--js-flags="--max-old-space-size=256"'
-        ],
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      });
-    };
-
-    try {
-      browser = await launchBrowser();
-
-      while (sessions.get(chatId)?.active) {
-        try {
-          const currentSession = sessions.get(chatId);
-          if (!currentSession) break;
-
-          sendTempLog(chatId, 'Connecting to OpenRouter API to generate usernames...');
-          const usernames = await generateUsernames(process.env.OPENROUTER_API_KEY || '');
-          if (!usernames.length) {
-            sendTempLog(chatId, 'No usernames generated, retrying in 5s...');
-            await new Promise(r => setTimeout(r, 5000));
-            continue;
-          }
-
-          const toCheck = usernames.filter(u => !checkedCache.has(u));
-          sendTempLog(chatId, `Generated ${usernames.length} usernames. Checking ${toCheck.length} new ones...`);
-          
-          // Send generated usernames to user for 2 minutes
-          if (usernames.length > 0) {
-            bot.sendMessage(chatId, `📝 Generated Batch:\n${usernames.join(', ')}`).then(msg => {
-              setTimeout(() => {
-                bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
-              }, 120000); // 120,000 ms = 2 minutes
-            }).catch(err => console.error('Failed to send generated usernames:', err));
-          }
-
-          if (toCheck.length === 0) {
-            sendTempLog(chatId, 'All generated usernames were already checked. Generating a new batch...');
-            await new Promise(r => setTimeout(r, 2000));
-            continue;
-          }
-          
-          // Process in chunks to safely restart browser between chunks without interrupting active checks
-          const chunkSize = 40;
-          for (let i = 0; i < toCheck.length; i += chunkSize) {
-            if (!sessions.get(chatId)?.active) break;
-            
-            const currentSession = sessions.get(chatId);
-            if (!currentSession) break;
-
-            // Restart browser periodically to free memory
-            if (currentSession.checksSinceRestart >= 10 || !browser || !browser.isConnected()) {
-              logger.info('Restarting browser to free memory...', { chatId });
-              if (browser) await browser.close().catch(() => {});
-              browser = await launchBrowser();
-              currentSession.checksSinceRestart = 0;
-              
-              // Clear log file if it gets too large (> 5MB)
-              try {
-                const stats = fs.statSync('app.log');
-                if (stats.size > 5 * 1024 * 1024) {
-                  fs.writeFileSync('app.log', '');
-                  logger.info('Log file cleared due to size');
-                }
-              } catch (e) {}
-            }
-
-            const chunk = toCheck.slice(i, i + chunkSize);
-            let checkedInChunk = 0;
-            
-            await pMapLimit(chunk, 1, async (username) => {
-              const session = sessions.get(chatId);
-              if (!session || !session.active) return;
-              
-              session.currentChecking.push(username);
-              updateStatusMessage(chatId, session).catch(() => {});
-
-              let available = false;
-              let checkSuccess = false;
-              
-              try {
-                for (let attempt = 1; attempt <= 3; attempt++) {
-                  if (!sessions.get(chatId)?.active) return;
-                  
-                  // Ensure browser is healthy before each check
-                  if (!browser || !browser.isConnected()) {
-                    try {
-                      sendTempLog(chatId, 'Browser disconnected. Reconnecting...');
-                      if (browser) await browser.close().catch(() => {});
-                      browser = await launchBrowser();
-                    } catch (e) {
-                      console.error('Failed to recover browser:', e);
-                      await new Promise(r => setTimeout(r, 5000));
-                      continue;
-                    }
-                  }
-
-                  try {
-                    // Wrap in a timeout to prevent deadlocks if Puppeteer hangs
-                    // Increased timeout to 60s to accommodate internal page timeouts
-                    available = await Promise.race([
-                      checkUsernameAvailability(username, browser),
-                      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 60000))
-                    ]);
-                    checkSuccess = true;
-                    break; // Success, exit retry loop
-                  } catch (err: any) {
-                    logger.error(`Attempt ${attempt} failed for ${username}`, { error: err.message, username });
-                    
-                    // If browser crashed, force a restart for the next attempt
-                    if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error') || err?.message?.includes('timeout')) {
-                      if (browser) await browser.close().catch(() => {});
-                      browser = null;
-                    }
-
-                    if (attempt < 2) { // Reduced to 1 retry (total 2 attempts)
-                      await new Promise(r => setTimeout(r, 2000));
-                    }
-                  }
-                }
-              } finally {
-                const s = sessions.get(chatId);
-                if (s) {
-                  s.currentChecking = s.currentChecking.filter(u => u !== username);
-                }
-              }
-              
-              const sessionFinal = sessions.get(chatId);
-              if (!sessionFinal || !sessionFinal.active) return;
-
-              sessionFinal.checksSinceRestart++;
-              checkedInChunk++;
-
-              if (checkSuccess) {
-                if (available) {
-                  sessionFinal.availableCount++;
-                  bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
-                    logger.info(`Found available username: ${username}`, { chatId });
-                    setTimeout(() => {
-                      bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
-                    }, 120000); // Delete after 2 minutes (120,000 ms)
-                  }).catch(err => logger.error('Failed to send available message', { error: err, username }));
-                } else {
-                  sessionFinal.unavailableCount++;
-                }
-              } else {
-                sessionFinal.unknownCount++;
-              }
-            });
-            
-            // Update status message after every chunk
-            const sessionAfterChunk = sessions.get(chatId);
-            if (sessionAfterChunk && sessionAfterChunk.active) {
-              await updateStatusMessage(chatId, sessionAfterChunk);
-            }
-          }
-          
-          if (sessions.get(chatId)?.active) {
-            await new Promise(r => setTimeout(r, 5000)); // Pause between cycles
-          }
-        } catch (error: any) {
-          logger.error('Loop error', { error: error.message, chatId });
-          const errorMessage = error?.message || String(error);
-          if (errorMessage.includes('429') || errorMessage.includes('Quota')) {
-            sendTempLog(chatId, 'OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...', true);
-            await new Promise(r => setTimeout(r, 60000));
-          } else {
-            sendTempLog(chatId, `${errorMessage}\n\nRetrying in 5s...`, true);
-            if (browser) {
-              await browser.close().catch(() => {});
-              browser = null; // Force restart on next loop
-            }
-            await new Promise(r => setTimeout(r, 5000));
-          }
-        }
-      }
-    } catch (error) {
-      logger.error('Fatal error', { error, chatId });
-      bot.sendMessage(chatId, '❌ A fatal error occurred. Search stopped.');
-      const session = sessions.get(chatId);
-      if (session) {
-        session.active = false;
-        sessions.delete(chatId);
-      }
-    } finally {
-      if (browser) await browser.close().catch(() => {});
-    }
+    startSearchLoop(chatId);
   });
 
   bot.onText(/\/stop/, (msg) => {
@@ -485,9 +321,8 @@ if (bot) {
     const session = sessions.get(chatId);
     if (session && session.active) {
       session.active = false;
-      
+      saveSessions();
       updateStatusMessage(chatId, session, 'Stopped 🔴').then(() => {
-        sessions.delete(chatId);
         bot.sendMessage(chatId, '🛑 Search stopped.');
       });
     } else {
@@ -510,6 +345,175 @@ if (bot) {
       bot.sendMessage(chatId, '❌ Log file not found.');
     }
   });
+
+  // Auto-resume sessions on startup
+  loadSessions();
+  sessions.forEach((session, chatId) => {
+    if (session.active) {
+      logger.info(`Resuming session for ${chatId}`);
+      bot.sendMessage(chatId, '🔄 *Bot restarted:* Resuming your search automatically...', { parse_mode: 'Markdown' }).catch(() => {});
+      startSearchLoop(chatId);
+    }
+  });
   
   logger.info('Telegram bot is ready and listening for commands.');
+}
+
+async function startSearchLoop(chatId: number) {
+  logger.info(`Starting search loop for ${chatId}`);
+  
+  let browser: any = null;
+
+  const launchBrowser = async () => {
+    return await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--disable-extensions',
+        '--single-process',
+        '--disable-canvas-aa',
+        '--disable-2d-canvas-clip-aa',
+        '--disable-gl-drawing-for-tests',
+        '--no-first-run',
+        '--js-flags="--max-old-space-size=256"'
+      ],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    });
+  };
+
+  while (true) {
+    const session = sessions.get(chatId);
+    if (!session || !session.active) {
+      logger.info(`Loop ending for ${chatId} (session inactive or removed)`);
+      break;
+    }
+
+    const apiKey = session.apiKey || process.env.OPENROUTER_API_KEY || '';
+
+    try {
+      while (sessions.get(chatId)?.active) {
+        const currentSession = sessions.get(chatId);
+        if (!currentSession || !currentSession.active) break;
+
+        await updateStatusMessage(chatId, currentSession, 'Generating Usernames... 🧠');
+        
+        let usernames: string[] = [];
+        try {
+          usernames = await generateUsernames(apiKey);
+        } catch (err: any) {
+          logger.error('Generation failed', { error: err.message });
+          await updateStatusMessage(chatId, currentSession, 'Retrying Generation... ⏳');
+          await new Promise(r => setTimeout(r, 60000));
+          continue;
+        }
+
+        if (!usernames.length) {
+          await new Promise(r => setTimeout(r, 10000));
+          continue;
+        }
+
+        const toCheck = usernames.filter(u => !checkedCache.has(u));
+        if (toCheck.length === 0) {
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
+
+        const chunkSize = 3;
+        for (let i = 0; i < toCheck.length; i += chunkSize) {
+          if (!sessions.get(chatId)?.active) break;
+
+          // Restart browser periodically
+          if (currentSession.checksSinceRestart >= 6 || !browser || !browser.isConnected()) {
+            if (browser) await browser.close().catch(() => {});
+            browser = await launchBrowser();
+            currentSession.checksSinceRestart = 0;
+            
+            try {
+              const stats = fs.statSync('app.log');
+              if (stats.size > 5 * 1024 * 1024) {
+                fs.writeFileSync('app.log', '');
+              }
+            } catch (e) {}
+          }
+
+          const chunk = toCheck.slice(i, i + chunkSize);
+          
+          await pMapLimit(chunk, 1, async (username) => {
+            const s = sessions.get(chatId);
+            if (!s || !s.active) return;
+            
+            s.currentChecking.push(username);
+            updateStatusMessage(chatId, s).catch(() => {});
+
+            let available = false;
+            let checkSuccess = false;
+            
+            try {
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                if (!sessions.get(chatId)?.active) return;
+                
+                if (!browser || !browser.isConnected()) {
+                  if (browser) await browser.close().catch(() => {});
+                  browser = await launchBrowser();
+                }
+
+                try {
+                  available = await Promise.race([
+                    checkUsernameAvailability(username, browser),
+                    new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 60000))
+                  ]);
+                  checkSuccess = true;
+                  break;
+                } catch (err: any) {
+                  logger.error(`Attempt ${attempt} failed for ${username}`, { error: err.message, username });
+                  if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error') || err?.message?.includes('timeout')) {
+                    if (browser) await browser.close().catch(() => {});
+                    browser = null;
+                  }
+                  if (attempt < 2) await new Promise(r => setTimeout(r, 5000));
+                }
+              }
+            } finally {
+              const sFinal = sessions.get(chatId);
+              if (sFinal) sFinal.currentChecking = sFinal.currentChecking.filter(u => u !== username);
+            }
+            
+            const sFinal = sessions.get(chatId);
+            if (!sFinal || !sFinal.active) return;
+
+            sFinal.checksSinceRestart++;
+
+            if (checkSuccess) {
+              if (available) {
+                sFinal.availableCount++;
+                bot?.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                  setTimeout(() => bot?.deleteMessage(chatId, msg.message_id).catch(() => {}), 120000);
+                }).catch(() => {});
+              } else {
+                sFinal.unavailableCount++;
+              }
+            } else {
+              sFinal.unknownCount++;
+            }
+          });
+          
+          if (sessions.get(chatId)?.active) {
+            await updateStatusMessage(chatId, currentSession);
+            saveSessions();
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.error('Search loop crash, restarting...', { error: err.message });
+      if (browser) await browser.close().catch(() => {});
+      browser = null;
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+
+  if (browser) await browser.close().catch(() => {});
 }
