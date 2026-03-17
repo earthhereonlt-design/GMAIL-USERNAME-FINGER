@@ -182,6 +182,7 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
 
   let page;
   try {
+    logger.debug(`Starting check for: ${username}`);
     page = await browser.newPage();
     
     // Block unnecessary resources to speed up and prevent timeouts
@@ -196,38 +197,48 @@ async function checkUsernameAvailability(username: string, browser: any): Promis
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
-    // Use domcontentloaded for faster navigation
-    await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    logger.debug(`Navigating to Google sign-in for: ${username}`);
+    await page.goto('https://accounts.google.com/signin', { waitUntil: 'domcontentloaded', timeout: 30000 });
     
     const emailSelector = 'input[type="email"], input[name="identifier"], #identifierId';
-    await page.waitForSelector(emailSelector, { timeout: 10000 });
+    logger.debug(`Waiting for email selector for: ${username}`);
+    await page.waitForSelector(emailSelector, { timeout: 15000 });
     
-    // Small random delay to simulate human typing
-    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
-    await page.type(emailSelector, username, { delay: 30 });
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+    logger.debug(`Typing username: ${username}`);
+    await page.type(emailSelector, username, { delay: 10 });
     
-    // Press Enter and try to click Next button
+    logger.debug(`Submitting username: ${username}`);
     await Promise.all([
       page.keyboard.press('Enter'),
       page.click('#identifierNext button').catch(() => {})
     ]);
 
+    logger.debug(`Waiting for result for: ${username}`);
     const result = await Promise.race([
-      page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 10000 }).then(() => 'taken'),
+      page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 15000 }).then(() => 'taken'),
       page.waitForFunction(() => {
         const text = document.body.innerText || '';
         return text.includes("Couldn't find your Google Account") || 
                text.includes("Enter a valid email or phone number") ||
                text.includes("find your Google account");
-      }, { timeout: 10000 }).then(() => 'available'),
-      new Promise(resolve => setTimeout(() => resolve('unknown'), 10500))
+      }, { timeout: 15000 }).then(() => 'available'),
+      new Promise(resolve => setTimeout(() => resolve('unknown'), 16000))
     ]);
+
+    logger.info(`Check result for ${username}: ${result}`);
+    
+    if (result === 'unknown') {
+      // If unknown, it might be a CAPTCHA or a block. Log the page text for debugging.
+      const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500));
+      logger.warn(`Unknown result for ${username}. Page snippet: ${bodyText.replace(/\n/g, ' ')}`);
+    }
 
     const isAvailable = result === 'available';
     if (result !== 'unknown') addToCache(username, isAvailable);
     return isAvailable;
-  } catch (error) {
-    console.error(`Error checking ${username}:`, error);
+  } catch (error: any) {
+    logger.error(`Error checking ${username}`, { error: error.message });
     return false;
   } finally {
     if (page) await page.close().catch(() => {});
@@ -358,9 +369,10 @@ if (bot) {
 
                   try {
                     // Wrap in a timeout to prevent deadlocks if Puppeteer hangs
+                    // Increased timeout to 60s to accommodate internal page timeouts
                     available = await Promise.race([
                       checkUsernameAvailability(username, browser),
-                      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 35000))
+                      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 60000))
                     ]);
                     checkSuccess = true;
                     break; // Success, exit retry loop
@@ -368,13 +380,13 @@ if (bot) {
                     logger.error(`Attempt ${attempt} failed for ${username}`, { error: err.message, username });
                     
                     // If browser crashed, force a restart for the next attempt
-                    if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error')) {
+                    if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error') || err?.message?.includes('timeout')) {
                       if (browser) await browser.close().catch(() => {});
                       browser = null;
                     }
 
-                    if (attempt < 3) {
-                      await new Promise(r => setTimeout(r, 3000)); // wait 3s before retry
+                    if (attempt < 2) { // Reduced to 1 retry (total 2 attempts)
+                      await new Promise(r => setTimeout(r, 2000));
                     }
                   }
                 }
