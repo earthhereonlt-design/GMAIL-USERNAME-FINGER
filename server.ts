@@ -1,29 +1,29 @@
-import express from 'express';
+import http from 'http';
 import TelegramBot from 'node-telegram-bot-api';
-import OpenAI from 'openai';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dotenv from 'dotenv';
-import async from 'async';
+import fs from 'fs';
+import { logger } from './src/utils/logger.js';
 
 dotenv.config();
 puppeteer.use(StealthPlugin());
 
-const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-// Dummy endpoint for Render Web Service health check
-app.get('/', (req, res) => {
-  res.send('Telegram Bot is running!');
+// Lightweight health check server using native http
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Telegram Bot is running!');
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Web server running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  logger.info(`Web server running on port ${PORT}`);
 });
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
-  console.error('TELEGRAM_BOT_TOKEN is missing. Please set it in your environment variables.');
+  logger.error('TELEGRAM_BOT_TOKEN is missing. Please set it in your environment variables.');
 }
 
 const bot = token ? new TelegramBot(token, { polling: true }) : null;
@@ -35,6 +35,7 @@ interface SearchSession {
   statusMessageId?: number;
   lastErrorMsgId?: number;
   checksSinceRestart: number;
+  currentChecking: string[];
 }
 const sessions = new Map<number, SearchSession>();
 const checkedCache = new Map<string, boolean>();
@@ -51,17 +52,40 @@ function addToCache(username: string, isAvailable: boolean) {
 async function updateStatusMessage(chatId: number, session: SearchSession, status: string = 'Running 🟢') {
   if (!bot || !session.active) return;
   const totalAttempts = session.availableCount + session.unavailableCount;
-  const text = `📊 Status: ${status}\n🔄 Total Attempts: ${totalAttempts}\n✅ Available found: ${session.availableCount}\n❌ Unavailable checked: ${session.unavailableCount}`;
+  const checkingText = session.currentChecking.length > 0 
+    ? `\n🔍 *Currently checking:* \`${session.currentChecking.join(', ')}\``
+    : '';
+
+  const text = `
+✨ *Gmail Checker Status* ✨
+━━━━━━━━━━━━━━━━━━━━
+📡 *Status:* ${status}
+🔄 *Total Attempts:* \`${totalAttempts}\`
+✅ *Available:* \`${session.availableCount}\`
+❌ *Unavailable:* \`${session.unavailableCount}\`
+${checkingText}
+━━━━━━━━━━━━━━━━━━━━
+_Searching for your next username..._`;
   
   try {
-    // Delete old message and send a new one so it stays at the bottom
     if (session.statusMessageId) {
-      await bot.deleteMessage(chatId, session.statusMessageId).catch(() => {});
+      await bot.editMessageText(text, {
+        chat_id: chatId,
+        message_id: session.statusMessageId,
+        parse_mode: 'Markdown'
+      }).catch(async (err) => {
+        // If edit fails (e.g. message deleted), send a new one
+        if (err.message.includes('message to edit not found') || err.message.includes('message is not modified')) {
+          const newMsg = await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+          session.statusMessageId = newMsg.message_id;
+        }
+      });
+    } else {
+      const newMsg = await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+      session.statusMessageId = newMsg.message_id;
     }
-    const newMsg = await bot.sendMessage(chatId, text);
-    session.statusMessageId = newMsg.message_id;
   } catch (err) {
-    console.error('Failed to update status message:', err);
+    logger.error('Failed to update status message', { error: err, chatId });
   }
 }
 
@@ -83,7 +107,7 @@ async function sendTempLog(chatId: number, text: string, isError: boolean = fals
       bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
     }, 60000);
   } catch (err) {
-    console.error('Failed to send temp log:', err);
+    logger.error('Failed to send temp log', { error: err, chatId, text });
   }
 }
 
@@ -92,11 +116,6 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
     const keyToUse = apiKey || process.env.OPENROUTER_API_KEY;
     if (!keyToUse) throw new Error("OpenRouter API key is missing.");
     
-    const openai = new OpenAI({
-      baseURL: "https://openrouter.ai/api/v1",
-      apiKey: keyToUse,
-    });
-
     const prompt = `
       Generate exactly 100 unique Gmail username ideas.
       The user wants usernames that combine a theme word (Nature, Tech, or Anime/Pokémon) with a programming language extension or tech term.
@@ -110,21 +129,52 @@ async function generateUsernames(apiKey: string): Promise<string[]> {
       - Return ONLY a JSON array of strings. No markdown formatting, just the raw JSON array like ["name1", "name2"].
     `;
 
-    const completion = await openai.chat.completions.create({
-      model: "stepfun/step-3.5-flash:free",
-      messages: [{ role: "user", content: prompt }],
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${keyToUse}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/OpenRouterTeam/openrouter-runner",
+        "X-Title": "Gmail Checker Bot"
+      },
+      body: JSON.stringify({
+        model: "stepfun/step-3.5-flash:free",
+        messages: [{ role: "user", content: prompt }]
+      })
     });
 
-    const text = completion.choices[0]?.message?.content;
-    if (!text) return [];
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(`OpenRouter API error: ${response.status} ${JSON.stringify(errorData)}`);
+    }
+
+    const data: any = await response.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) {
+      logger.warn('OpenRouter returned empty content');
+      return [];
+    }
     
     const cleanedText = text.replace(/```json/g, '').replace(/```/g, '').trim();
     const usernames = JSON.parse(cleanedText);
+    logger.info(`Generated ${usernames.length} usernames`);
     return Array.isArray(usernames) ? usernames.map((u: any) => String(u).toLowerCase().replace(/[^a-z0-9.]/g, '')) : [];
   } catch (error) {
-    console.error('Error generating usernames:', error);
+    logger.error('Error generating usernames', { error });
     throw error;
   }
+}
+
+// Native lightweight concurrency helper to replace 'async' library
+async function pMapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
+  const queue = [...items];
+  const workers = Array(Math.min(limit, queue.length)).fill(null).map(async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item !== undefined) await fn(item);
+    }
+  });
+  await Promise.all(workers);
 }
 
 async function checkUsernameAvailability(username: string, browser: any): Promise<boolean> {
@@ -199,6 +249,7 @@ if (bot) {
       availableCount: 0,
       unavailableCount: 0,
       checksSinceRestart: 0,
+      currentChecking: [],
     };
     sessions.set(chatId, session);
     await updateStatusMessage(chatId, session, 'Starting...');
@@ -213,7 +264,6 @@ if (bot) {
           '--disable-dev-shm-usage',
           '--disable-gpu',
           '--no-zygote',
-          '--single-process',
           '--disable-extensions'
         ],
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -273,45 +323,78 @@ if (bot) {
             const chunk = toCheck.slice(i, i + chunkSize);
             let checkedInChunk = 0;
             
-            await async.eachLimit(chunk, 10, async (username) => {
-              if (!sessions.get(chatId)?.active) return;
+            await pMapLimit(chunk, 3, async (username) => {
+              const session = sessions.get(chatId);
+              if (!session || !session.active) return;
               
+              session.currentChecking.push(username);
+              updateStatusMessage(chatId, session).catch(() => {});
+
               let available = false;
               let checkSuccess = false;
               
-              for (let attempt = 1; attempt <= 3; attempt++) {
-                if (!sessions.get(chatId)?.active) return;
-                try {
-                  // Wrap in a timeout to prevent deadlocks if Puppeteer hangs
-                  available = await Promise.race([
-                    checkUsernameAvailability(username, browser),
-                    new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 30000))
-                  ]);
-                  checkSuccess = true;
-                  break; // Success, exit retry loop
-                } catch (err) {
-                  console.error(`Attempt ${attempt} failed for ${username}:`, err);
-                  if (attempt < 3) {
-                    await new Promise(r => setTimeout(r, 2000)); // wait 2s before retry
+              try {
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                  if (!sessions.get(chatId)?.active) return;
+                  
+                  // Ensure browser is healthy before each check
+                  if (!browser || !browser.isConnected()) {
+                    try {
+                      sendTempLog(chatId, 'Browser disconnected. Reconnecting...');
+                      if (browser) await browser.close().catch(() => {});
+                      browser = await launchBrowser();
+                    } catch (e) {
+                      console.error('Failed to recover browser:', e);
+                      await new Promise(r => setTimeout(r, 5000));
+                      continue;
+                    }
                   }
+
+                  try {
+                    // Wrap in a timeout to prevent deadlocks if Puppeteer hangs
+                    available = await Promise.race([
+                      checkUsernameAvailability(username, browser),
+                      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 35000))
+                    ]);
+                    checkSuccess = true;
+                    break; // Success, exit retry loop
+                  } catch (err: any) {
+                    logger.error(`Attempt ${attempt} failed for ${username}`, { error: err.message, username });
+                    
+                    // If browser crashed, force a restart for the next attempt
+                    if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error')) {
+                      if (browser) await browser.close().catch(() => {});
+                      browser = null;
+                    }
+
+                    if (attempt < 3) {
+                      await new Promise(r => setTimeout(r, 3000)); // wait 3s before retry
+                    }
+                  }
+                }
+              } finally {
+                const s = sessions.get(chatId);
+                if (s) {
+                  s.currentChecking = s.currentChecking.filter(u => u !== username);
                 }
               }
               
-              const session = sessions.get(chatId);
-              if (!session || !session.active) return;
+              const sessionFinal = sessions.get(chatId);
+              if (!sessionFinal || !sessionFinal.active) return;
 
-              session.checksSinceRestart++;
+              sessionFinal.checksSinceRestart++;
               checkedInChunk++;
 
               if (checkSuccess && available) {
-                session.availableCount++;
+                sessionFinal.availableCount++;
                 bot.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                  logger.info(`Found available username: ${username}`, { chatId });
                   setTimeout(() => {
                     bot?.deleteMessage(chatId, msg.message_id).catch(() => {});
                   }, 120000); // Delete after 2 minutes (120,000 ms)
-                }).catch(err => console.error('Failed to send available message:', err));
+                }).catch(err => logger.error('Failed to send available message', { error: err, username }));
               } else {
-                session.unavailableCount++;
+                sessionFinal.unavailableCount++;
               }
             });
             
@@ -326,7 +409,7 @@ if (bot) {
             await new Promise(r => setTimeout(r, 5000)); // Pause between cycles
           }
         } catch (error: any) {
-          console.error('Loop error:', error);
+          logger.error('Loop error', { error: error.message, chatId });
           const errorMessage = error?.message || String(error);
           if (errorMessage.includes('429') || errorMessage.includes('Quota')) {
             sendTempLog(chatId, 'OpenRouter API rate limit exceeded. Waiting 60 seconds before retrying...', true);
@@ -342,7 +425,7 @@ if (bot) {
         }
       }
     } catch (error) {
-      console.error('Fatal error:', error);
+      logger.error('Fatal error', { error, chatId });
       bot.sendMessage(chatId, '❌ A fatal error occurred. Search stopped.');
       const session = sessions.get(chatId);
       if (session) {
@@ -368,6 +451,22 @@ if (bot) {
       bot.sendMessage(chatId, 'No active search to stop.');
     }
   });
+
+  bot.onText(/\/logs/, async (msg) => {
+    const chatId = msg.chat.id;
+    const logPath = logger.getLogFilePath();
+    
+    if (fs.existsSync(logPath)) {
+      try {
+        await bot.sendDocument(chatId, logPath, { caption: '📄 Application Logs' });
+      } catch (err) {
+        logger.error('Failed to send logs', { error: err, chatId });
+        bot.sendMessage(chatId, '❌ Failed to send log file.');
+      }
+    } else {
+      bot.sendMessage(chatId, '❌ Log file not found.');
+    }
+  });
   
-  console.log('Telegram bot is ready and listening for commands.');
+  logger.info('Telegram bot is ready and listening for commands.');
 }
