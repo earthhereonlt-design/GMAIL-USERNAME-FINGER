@@ -37,6 +37,44 @@ if (!token) {
 
 const bot = token ? new TelegramBot(token, { polling: true }) : null;
 
+if (bot) {
+  bot.on('polling_error', (error: any) => {
+    if (error.message.includes('ETELEGRAM: 409 Conflict')) {
+      // This is common during restarts/deploys as the old instance shuts down
+      logger.warn('Telegram polling conflict (409). Waiting for old instance to terminate...');
+    } else {
+      logger.error('Telegram polling error:', { error: error.message });
+    }
+  });
+}
+
+// Clean shutdown logic
+const shutdown = async (signal: string) => {
+  logger.info(`${signal} received. Starting graceful shutdown...`);
+  
+  if (bot) {
+    logger.info('Stopping Telegram bot polling...');
+    await bot.stopPolling();
+  }
+
+  // Save sessions before exiting
+  saveSessions();
+
+  server.close(() => {
+    logger.info('HTTP server closed.');
+    process.exit(0);
+  });
+
+  // Force exit after 10s if not closed
+  setTimeout(() => {
+    logger.error('Shutdown timed out, forcing exit.');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 interface SearchSession {
   active: boolean;
   availableCount: number;
