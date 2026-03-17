@@ -11,10 +11,7 @@ export enum LogLevel {
 }
 
 class Logger {
-  private logStream: fs.WriteStream;
-
   constructor() {
-    this.logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
   }
 
   private formatMessage(level: LogLevel, message: string, context?: any): string {
@@ -30,8 +27,12 @@ class Logger {
     const color = level === LogLevel.ERROR ? '\x1b[31m' : level === LogLevel.WARN ? '\x1b[33m' : '\x1b[32m';
     console.log(`${color}${formattedMessage}\x1b[0m`.trim());
 
-    // Log to file
-    this.logStream.write(formattedMessage);
+    // Log to file immediately
+    try {
+      fs.appendFileSync(LOG_FILE, formattedMessage);
+    } catch (e) {
+      console.error('Failed to write to log file', e);
+    }
   }
 
   info(message: string, context?: any) {

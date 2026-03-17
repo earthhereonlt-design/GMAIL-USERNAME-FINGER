@@ -1,14 +1,16 @@
 import http from 'http';
 import path from 'path';
 import TelegramBot from 'node-telegram-bot-api';
-import puppeteer from 'puppeteer-extra';
+import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import os from 'os';
 import { logger } from './src/utils/logger.js';
 
 dotenv.config();
-puppeteer.use(StealthPlugin());
+// @ts-ignore
+chromium.use(StealthPlugin());
 
 process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection at:', { promise, reason });
@@ -17,6 +19,21 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception:', { error: error.message, stack: error.stack });
 });
+
+// Memory Watchdog: Monitor system memory and force cleanup if needed
+setInterval(() => {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+  const usedPercent = (usedMem / totalMem) * 100;
+
+  if (usedPercent > 85) {
+    logger.warn(`High memory usage detected (${usedPercent.toFixed(1)}%). Performing emergency cleanup...`);
+    if (global.gc) {
+      global.gc();
+    }
+  }
+}, 30000);
 
 const PORT = 3000;
 
@@ -41,7 +58,7 @@ if (bot) {
   // Clear any existing webhooks and verify connection
   bot.getMe().then((me) => {
     logger.info(`Bot identified as @${me.username} (${me.id})`);
-    return bot.deleteWebhook();
+    return bot.deleteWebHook();
   }).then(() => {
     logger.info('Webhook cleared, polling started.');
   }).catch((err) => {
@@ -126,7 +143,7 @@ function loadSessions() {
 
 // Limit cache size to prevent memory leaks
 function addToCache(username: string, isAvailable: boolean) {
-  if (checkedCache.size > 5000) {
+  if (checkedCache.size > 1000) {
     const firstKey = checkedCache.keys().next().value;
     if (firstKey) checkedCache.delete(firstKey);
   }
@@ -265,77 +282,70 @@ async function pMapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<
 async function checkUsernameAvailability(username: string, browser: any): Promise<boolean> {
   if (checkedCache.has(username)) return checkedCache.get(username)!;
 
-  let page;
+  let context = null;
+  let page = null;
   try {
     logger.debug(`Starting check for: ${username}`);
-    page = await browser.newPage();
     
-    // Block unnecessary resources to speed up and prevent timeouts
-    await page.setRequestInterception(true);
-    page.on('request', (req: any) => {
-      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-        req.abort();
+    // Create an isolated incognito context for every check
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 800, height: 600 }
+    });
+    
+    page = await context.newPage();
+    
+    // Block unnecessary resources to speed up and save memory
+    await page.route('**/*', (route: any) => {
+      const type = route.request().resourceType();
+      if (['image', 'stylesheet', 'font', 'media', 'other'].includes(type)) {
+        route.abort();
       } else {
-        req.continue();
+        route.continue();
       }
     });
 
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    
     logger.debug(`Navigating to Google sign-in for: ${username}`);
-    // Use a more direct service URL which is often lighter
-    await page.goto('https://accounts.google.com/AccountChooser?service=mail&continue=https://mail.google.com/mail/', { 
-      waitUntil: 'networkidle2', 
-      timeout: 40000 
+    await page.goto('https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin', { 
+      waitUntil: 'commit', 
+      timeout: 60000 
     });
     
-    const emailSelector = 'input[type="email"], input[name="identifier"], #identifierId';
-    logger.debug(`Waiting for email selector for: ${username}`);
+    const emailSelector = 'input[type="email"]';
     await page.waitForSelector(emailSelector, { timeout: 20000 });
     
-    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
-    logger.debug(`Typing username: ${username}`);
-    await page.type(emailSelector, username, { delay: 10 });
-    
-    logger.debug(`Submitting username: ${username}`);
-    await Promise.all([
-      page.keyboard.press('Enter'),
-      page.click('#identifierNext button').catch(() => {})
-    ]);
+    await page.fill(emailSelector, username);
+    await page.keyboard.press('Enter');
 
     logger.debug(`Waiting for result for: ${username}`);
-    const result = await Promise.race([
-      page.waitForSelector('input[type="password"], input[name="Passwd"]', { timeout: 20000 }).then(() => 'taken'),
+    
+    // Playwright's race is more efficient
+    const result = await Promise.any([
+      page.waitForSelector('input[type="password"]', { timeout: 15000 }).then(() => 'taken'),
       page.waitForFunction(() => {
         const text = document.body.innerText || '';
         return text.includes("Couldn't find your Google Account") || 
-               text.includes("Enter a valid email or phone number") ||
-               text.includes("find your Google account");
-      }, { timeout: 20000 }).then(() => 'available'),
-      page.waitForSelector('#captcha, img[src*="captcha"], iframe[src*="recaptcha"]', { timeout: 20000 }).then(() => 'blocked'),
+               text.includes("Enter a valid email or phone number");
+      }, { timeout: 15000 }).then(() => 'available'),
+      page.waitForSelector('#captcha, img[src*="captcha"]', { timeout: 15000 }).then(() => 'blocked'),
       page.waitForFunction(() => {
         const text = document.body.innerText || '';
         return text.includes("Verify it's you") || text.includes("unusual activity");
-      }, { timeout: 20000 }).then(() => 'blocked'),
-      new Promise(resolve => setTimeout(() => resolve('unknown'), 22000))
+      }, { timeout: 15000 }).then(() => 'blocked'),
+      new Promise<string>(resolve => setTimeout(() => resolve('unknown'), 16000))
     ]);
 
     logger.info(`Check result for ${username}: ${result}`);
     
-    if (result === 'unknown' || result === 'blocked') {
-      const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500));
-      logger.warn(`${result === 'blocked' ? 'Blocked by Google' : 'Unknown result'} for ${username}. Page snippet: ${bodyText.replace(/\n/g, ' ')}`);
-    }
-
     const isAvailable = result === 'available';
-    // Only cache clear results
     if (result === 'available' || result === 'taken') addToCache(username, isAvailable);
     return isAvailable;
   } catch (error: any) {
-    // Re-throw the error so the retry loop can handle it (e.g. browser crash)
-    throw error;
+    logger.error(`Error checking ${username}`, { error: error.message });
+    return false;
   } finally {
     if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
   }
 }
 
@@ -425,7 +435,8 @@ async function startSearchLoop(chatId: number) {
   let browser: any = null;
 
   const launchBrowser = async () => {
-    return await puppeteer.launch({
+    // @ts-ignore
+    return await chromium.launch({
       headless: true,
       args: [
         '--no-sandbox', 
@@ -433,15 +444,8 @@ async function startSearchLoop(chatId: number) {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--disable-extensions',
-        '--single-process',
-        '--disable-canvas-aa',
-        '--disable-2d-canvas-clip-aa',
-        '--disable-gl-drawing-for-tests',
-        '--no-first-run',
-        '--js-flags="--max-old-space-size=256"'
-      ],
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        '--single-process'
+      ]
     });
   };
 
@@ -482,23 +486,16 @@ async function startSearchLoop(chatId: number) {
           continue;
         }
 
-        const chunkSize = 3;
+        const chunkSize = 5; 
         for (let i = 0; i < toCheck.length; i += chunkSize) {
           if (!sessions.get(chatId)?.active) break;
-
-          // Restart browser periodically
-          if (currentSession.checksSinceRestart >= 6 || !browser || !browser.isConnected()) {
-            if (browser) await browser.close().catch(() => {});
-            browser = await launchBrowser();
-            currentSession.checksSinceRestart = 0;
-            
-            try {
-              const stats = fs.statSync('app.log');
-              if (stats.size > 5 * 1024 * 1024) {
-                fs.writeFileSync('app.log', '');
-              }
-            } catch (e) {}
-          }
+          
+          try {
+            const stats = fs.statSync('app.log');
+            if (stats.size > 1 * 1024 * 1024) {
+              fs.writeFileSync('app.log', '');
+            }
+          } catch (e) {}
 
           const chunk = toCheck.slice(i, i + chunkSize);
           
@@ -509,55 +506,48 @@ async function startSearchLoop(chatId: number) {
             s.currentChecking.push(username);
             updateStatusMessage(chatId, s).catch(() => {});
 
-            let available = false;
-            let checkSuccess = false;
-            
+            // Launch fresh browser for EVERY check to guarantee memory safety
+            let localBrowser = null;
             try {
-              for (let attempt = 1; attempt <= 2; attempt++) {
-                if (!sessions.get(chatId)?.active) return;
-                
-                if (!browser || !browser.isConnected()) {
-                  if (browser) await browser.close().catch(() => {});
-                  browser = await launchBrowser();
-                }
+              localBrowser = await launchBrowser();
+              
+              // Add a small cooldown between checks to reduce CPU load
+              await new Promise(r => setTimeout(r, 2000));
 
-                try {
-                  available = await Promise.race([
-                    checkUsernameAvailability(username, browser),
-                    new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 60000))
-                  ]);
-                  checkSuccess = true;
-                  break;
-                } catch (err: any) {
-                  logger.error(`Attempt ${attempt} failed for ${username}`, { error: err.message, username });
-                  if (err?.message?.includes('Target closed') || err?.message?.includes('Protocol error') || err?.message?.includes('timeout')) {
-                    if (browser) await browser.close().catch(() => {});
-                    browser = null;
-                  }
-                  if (attempt < 2) await new Promise(r => setTimeout(r, 5000));
-                }
+              let available = false;
+              let checkSuccess = false;
+              
+              try {
+                available = await Promise.race([
+                  checkUsernameAvailability(username, localBrowser),
+                  new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error('Check timeout')), 120000))
+                ]);
+                checkSuccess = true;
+              } catch (err: any) {
+                logger.error(`Check failed for ${username}`, { error: err.message, username });
               }
+
+              const sFinal = sessions.get(chatId);
+              if (!sFinal || !sFinal.active) return;
+
+              if (checkSuccess) {
+                if (available) {
+                  sFinal.availableCount++;
+                  bot?.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
+                    setTimeout(() => bot?.deleteMessage(chatId, msg.message_id).catch(() => {}), 120000);
+                  }).catch(() => {});
+                } else {
+                  sFinal.unavailableCount++;
+                }
+              } else {
+                sFinal.unknownCount++;
+              }
+            } catch (err: any) {
+              logger.error(`Browser launch failed for ${username}`, { error: err.message });
             } finally {
+              if (localBrowser) await localBrowser.close().catch(() => {});
               const sFinal = sessions.get(chatId);
               if (sFinal) sFinal.currentChecking = sFinal.currentChecking.filter(u => u !== username);
-            }
-            
-            const sFinal = sessions.get(chatId);
-            if (!sFinal || !sFinal.active) return;
-
-            sFinal.checksSinceRestart++;
-
-            if (checkSuccess) {
-              if (available) {
-                sFinal.availableCount++;
-                bot?.sendMessage(chatId, `✅ Available: ${username}@gmail.com`).then(msg => {
-                  setTimeout(() => bot?.deleteMessage(chatId, msg.message_id).catch(() => {}), 120000);
-                }).catch(() => {});
-              } else {
-                sFinal.unavailableCount++;
-              }
-            } else {
-              sFinal.unknownCount++;
             }
           });
           
